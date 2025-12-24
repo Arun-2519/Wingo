@@ -13,6 +13,7 @@ from io import BytesIO
 WINDOW = 10
 MIN_LEARN = 20
 CONF_THRESHOLD = 0.65
+STABILITY_THRESHOLD = 0.60
 DB_NAME = "users_ai.db"
 
 st.set_page_config(page_title="AI Wingo Predictor", layout="centered")
@@ -21,39 +22,33 @@ st.set_page_config(page_title="AI Wingo Predictor", layout="centered")
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 cur = conn.cursor()
 
-# USERS
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
+cur.execute("""CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
-    password TEXT
-)
-""")
+    password TEXT)""")
 
-# HISTORY
-cur.execute("""
-CREATE TABLE IF NOT EXISTS history (
+cur.execute("""CREATE TABLE IF NOT EXISTS history (
     username TEXT,
-    result INTEGER
-)
-""")
+    result INTEGER)""")
 
-# REPORTS (DROP & RECREATE SAFELY)
-cur.execute("DROP TABLE IF EXISTS reports")
-cur.execute("""
-CREATE TABLE reports (
+cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     username TEXT,
     time TEXT,
     confidence REAL,
+    stability REAL,
     prediction TEXT,
     actual TEXT,
-    note TEXT
-)
-""")
+    note TEXT)""")
+
 conn.commit()
 
 # ================= UTILS =================
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
+
+# ================= SOUND (SAFE URLs) =================
+SOUND_HIGH = "https://actions.google.com/sounds/v1/cartoon/clang_and_wobble.ogg"
+SOUND_WARN = "https://actions.google.com/sounds/v1/alarms/warning.ogg"
+SOUND_WAIT = "https://actions.google.com/sounds/v1/alarms/beep_short.ogg"
 
 # ================= LSTM =================
 def build_lstm():
@@ -74,8 +69,8 @@ def login_ui():
     st.subheader("🔐 Login / Signup")
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
-
     c1, c2 = st.columns(2)
+
     if c1.button("Login"):
         cur.execute("SELECT * FROM users WHERE username=? AND password=?", (u, hash_pw(p)))
         if cur.fetchone():
@@ -90,7 +85,7 @@ def login_ui():
             conn.commit()
             st.success("Account created. Login now.")
         except:
-            st.error("Username already exists")
+            st.error("Username exists")
 
 # ================= APP START =================
 st.title("🧠 AI Wingo Predictor")
@@ -112,6 +107,7 @@ if "init" not in st.session_state:
     st.session_state.prev = None
     st.session_state.X, st.session_state.y = [], []
     st.session_state.model = build_lstm()
+    st.session_state.pending_prediction = None
 
     cur.execute("SELECT result FROM history WHERE username=?", (st.session_state.user,))
     for (r,) in cur.fetchall():
@@ -121,14 +117,14 @@ if "init" not in st.session_state:
             st.session_state.markov[st.session_state.prev][r] += 1
         st.session_state.prev = r
 
-# ================= PREDICTION =================
+# ================= MODEL HELPERS =================
 def lstm_prob():
     if len(st.session_state.X) < MIN_LEARN:
         return 0.5
     seq = np.array(st.session_state.short).reshape(1,WINDOW,1)
     return float(st.session_state.model.predict(seq, verbose=0)[0][0])
 
-def ensemble():
+def ensemble_prob():
     m = st.session_state.markov[st.session_state.prev]
     m_prob = m[1] / (m[0]+m[1])
     g = st.session_state.global_c
@@ -136,84 +132,103 @@ def ensemble():
     l_prob = lstm_prob()
     return 0.3*m_prob + 0.2*g_prob + 0.5*l_prob
 
+def pattern_stability():
+    if st.session_state.prev is None:
+        return 0.0
+    m = st.session_state.markov[st.session_state.prev]
+    total = m[0] + m[1]
+    dominant = max(m[0], m[1]) / total
+    return dominant
+
 # ================= UI =================
-st.metric("Total Learned Rounds", len(st.session_state.X))
+st.metric("Learned Rounds", len(st.session_state.X))
 
 prediction = None
 confidence = 0.0
+stability = 0.0
 note = "LEARNING"
 
 if st.session_state.prev is not None:
     if len(st.session_state.X) < MIN_LEARN:
         st.info("⏳ WAIT FOR PATTERN (Learning...)")
+        st.audio(SOUND_WAIT)
     else:
-        confidence = ensemble()
-        if confidence >= CONF_THRESHOLD:
+        confidence = ensemble_prob()
+        stability = pattern_stability()
+
+        if confidence >= CONF_THRESHOLD and stability >= STABILITY_THRESHOLD:
             prediction = "BIG" if confidence >= 0.5 else "SMALL"
-            note = "PREDICTION"
+            st.session_state.pending_prediction = prediction
+            note = "READY"
+
             st.success(f"🎯 Prediction: {prediction}")
             st.write(f"Confidence: {confidence*100:.2f}%")
+            st.write(f"Pattern Stability: {stability:.2f}")
+            st.audio(SOUND_HIGH)
         else:
-            note = "LOW_CONFIDENCE"
-            st.warning("⏳ WAIT FOR PATTERN")
+            note = "WAIT"
+            st.warning("⚠️ WAIT FOR PATTERN (Unstable or Low Confidence)")
+            st.audio(SOUND_WARN)
 
-# ================= INPUT =================
-st.subheader("Enter Actual Result")
-c1, c2 = st.columns(2)
-actual = None
-if c1.button("BIG"): actual = 1
-if c2.button("SMALL"): actual = 0
+# ================= CONFIRM & LEARN =================
+st.subheader("Confirm & Learn")
 
-if actual is not None:
-    cur.execute("INSERT INTO history VALUES (?,?)", (st.session_state.user, actual))
+actual = st.selectbox("Enter actual result", ["BIG", "SMALL"])
+
+if st.button("Confirm & Learn"):
+    actual_val = 1 if actual == "BIG" else 0
+
+    cur.execute("INSERT INTO history VALUES (?,?)", (st.session_state.user, actual_val))
     conn.commit()
 
-    st.session_state.short.append(actual)
-    st.session_state.global_c[actual] += 1
+    st.session_state.short.append(actual_val)
+    st.session_state.global_c[actual_val] += 1
     if st.session_state.prev is not None:
-        st.session_state.markov[st.session_state.prev][actual] += 1
+        st.session_state.markov[st.session_state.prev][actual_val] += 1
 
     if len(st.session_state.short) == WINDOW:
         st.session_state.X.append(list(st.session_state.short))
-        st.session_state.y.append(actual)
+        st.session_state.y.append(actual_val)
         if len(st.session_state.X) % 10 == 0:
             X = np.array(st.session_state.X).reshape(-1,WINDOW,1)
             y = np.array(st.session_state.y)
             st.session_state.model.fit(X, y, epochs=3, verbose=0)
 
     cur.execute(
-        "INSERT INTO reports VALUES (?,?,?,?,?,?)",
+        "INSERT INTO reports VALUES (?,?,?,?,?,?,?)",
         (st.session_state.user, str(datetime.now()),
-         confidence*100, prediction,
-         "BIG" if actual==1 else "SMALL",
-         note)
+         confidence*100, stability,
+         st.session_state.pending_prediction,
+         actual, note)
     )
     conn.commit()
 
-    st.session_state.prev = actual
-    st.success("Saved & learning continues")
+    st.session_state.prev = actual_val
+    st.session_state.pending_prediction = None
+    st.success("Saved & model learned from result")
 
 # ================= EXCEL EXPORT =================
 st.divider()
 st.subheader("📊 Download Excel Report")
 
 cur.execute("""
-SELECT time, confidence, prediction, actual, note
+SELECT time, confidence, stability, prediction, actual, note
 FROM reports WHERE username=?
 """, (st.session_state.user,))
 rows = cur.fetchall()
 
 if rows:
-    df = pd.DataFrame(rows, columns=["Time","Confidence","Prediction","Actual","Note"])
-    buffer = BytesIO()
-    df.to_excel(buffer, index=False, engine="xlsxwriter")
-    buffer.seek(0)
+    df = pd.DataFrame(rows, columns=[
+        "Time","Confidence","Pattern Stability","Prediction","Actual","Note"
+    ])
+    buf = BytesIO()
+    df.to_excel(buf, index=False)
+    buf.seek(0)
 
     st.download_button(
         "⬇️ Download Excel",
-        data=buffer,
-        file_name="prediction_report.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        data=buf.getvalue(),
+        file_name="prediction_report.xlsx"
     )
 else:
-    st.info("No report data yet.")
+    st.info("No data yet.")
