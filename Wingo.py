@@ -4,7 +4,7 @@ import sqlite3, hashlib
 from collections import deque
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras.optimizers import Adam
+from tensorflow.kerasoptimizers import Adam
 import pandas as pd
 from datetime import datetime
 from io import StringIO
@@ -23,15 +23,26 @@ st.set_page_config(page_title="AI Wingo Predictor", layout="centered")
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 cur = conn.cursor()
 
-cur.execute("""CREATE TABLE IF NOT EXISTS users (
+# USERS
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
-    password TEXT)""")
+    password TEXT
+)
+""")
 
-cur.execute("""CREATE TABLE IF NOT EXISTS history (
+# HISTORY
+cur.execute("""
+CREATE TABLE IF NOT EXISTS history (
     username TEXT,
-    result INTEGER)""")
+    result INTEGER
+)
+""")
 
-cur.execute("""CREATE TABLE IF NOT EXISTS reports (
+# 🔥 DROP & RECREATE REPORTS (FIX)
+cur.execute("DROP TABLE IF EXISTS reports")
+cur.execute("""
+CREATE TABLE reports (
     username TEXT,
     time TEXT,
     confidence REAL,
@@ -40,7 +51,8 @@ cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     prediction TEXT,
     actual TEXT,
     result_status TEXT
-)""")
+)
+""")
 conn.commit()
 
 # ================= UTILS =================
@@ -108,9 +120,9 @@ if "init" not in st.session_state:
     st.session_state.global_c = {0:1,1:1}
     st.session_state.prev = None
     st.session_state.X, st.session_state.y = [], []
+    st.session_state.recent_results = deque(maxlen=10)
     st.session_state.model = build_lstm()
     st.session_state.pending_prediction = None
-    st.session_state.recent_results = deque(maxlen=10)
 
     cur.execute("SELECT result FROM history WHERE username=?", (st.session_state.user,))
     for (r,) in cur.fetchall():
@@ -215,7 +227,8 @@ if st.button("Confirm & Learn"):
         "INSERT INTO reports VALUES (?,?,?,?,?,?,?,?)",
         (st.session_state.user, str(datetime.now()),
          confidence*100, stability, threshold*100,
-         st.session_state.pending_prediction, actual, result_status)
+         st.session_state.pending_prediction,
+         actual, result_status)
     )
     conn.commit()
 
