@@ -5,83 +5,56 @@ from collections import deque
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
-import io, wave, math, pandas as pd
+import pandas as pd
 from datetime import datetime
+from io import BytesIO
 
-# =========================
-# CONFIG
-# =========================
+# ================= CONFIG =================
 WINDOW = 10
-MIN_LEARN = 10
-MAX_LEARN = 20
+MIN_LEARN = 20
+CONF_THRESHOLD = 0.65
 DB_NAME = "users_ai.db"
 
 st.set_page_config(page_title="AI Wingo Predictor", layout="centered")
 
-# =========================
-# DATABASE
-# =========================
+# ================= DATABASE =================
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 cur = conn.cursor()
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
+cur.execute("""CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
-    password TEXT
-)
-""")
+    password TEXT)""")
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS history (
+cur.execute("""CREATE TABLE IF NOT EXISTS history (
     username TEXT,
-    result INTEGER
-)
-""")
+    result INTEGER)""")
 
-cur.execute("""
-CREATE TABLE IF NOT EXISTS reports (
+cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     username TEXT,
     time TEXT,
-    prediction TEXT,
     confidence REAL,
+    prediction TEXT,
     actual TEXT,
-    outcome TEXT,
-    loss_streak INTEGER
-)
-""")
+    note TEXT)""")
+
 conn.commit()
 
-# =========================
-# UTILS
-# =========================
+# ================= UTILS =================
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-# =========================
-# SOUND
-# =========================
-def beep(freq=440, dur=0.25, rate=44100):
-    t = np.linspace(0, dur, int(rate * dur), False)
-    tone = np.sin(freq * t * 2 * math.pi)
-    audio = np.int16(tone / np.max(np.abs(tone)) * 32767)
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        wf.writeframes(audio.tobytes())
-    return buf.getvalue()
+# ================= LSTM =================
+def build_lstm():
+    model = Sequential([
+        LSTM(64, input_shape=(WINDOW,1), return_sequences=True),
+        Dropout(0.3),
+        LSTM(32),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
+    return model
 
-SOUND_HIGH = beep(900)
-SOUND_WARN = beep(500)
-SOUND_STOP = beep(250)
-
-def play(sound):
-    st.audio(sound, format="audio/wav")
-
-# =========================
-# LOGIN
-# =========================
+# ================= LOGIN =================
 if "user" not in st.session_state:
     st.session_state.user = None
 
@@ -89,8 +62,8 @@ def login_ui():
     st.subheader("🔐 Login / Signup")
     u = st.text_input("Username")
     p = st.text_input("Password", type="password")
-    c1, c2 = st.columns(2)
 
+    c1, c2 = st.columns(2)
     if c1.button("Login"):
         cur.execute("SELECT * FROM users WHERE username=? AND password=?", (u, hash_pw(p)))
         if cur.fetchone():
@@ -103,47 +76,27 @@ def login_ui():
         try:
             cur.execute("INSERT INTO users VALUES (?,?)", (u, hash_pw(p)))
             conn.commit()
-            st.success("Signup successful. Login now.")
+            st.success("Account created. Login now.")
         except:
-            st.error("Username already exists")
+            st.error("Username exists")
 
-# =========================
-# MODEL
-# =========================
-def build_lstm():
-    model = Sequential([
-        LSTM(64, input_shape=(WINDOW, 1), return_sequences=True),
-        Dropout(0.3),
-        LSTM(32),
-        Dense(1, activation="sigmoid")
-    ])
-    model.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
-    return model
-
-# =========================
-# APP START
-# =========================
+# ================= APP START =================
 st.title("🧠 AI Wingo Predictor")
 
 if not st.session_state.user:
     login_ui()
     st.stop()
 
-st.success(f"Logged in as {st.session_state.user}")
 if st.button("Logout"):
     st.session_state.clear()
     st.rerun()
 
-# =========================
-# INIT USER STATE
-# =========================
+# ================= INIT USER MEMORY =================
 if "init" not in st.session_state:
     st.session_state.init = True
     st.session_state.short = deque(maxlen=WINDOW)
     st.session_state.markov = {0:{0:1,1:1}, 1:{0:1,1:1}}
     st.session_state.global_c = {0:1,1:1}
-    st.session_state.loss = 0
-    st.session_state.win = 0
     st.session_state.prev = None
     st.session_state.X, st.session_state.y = [], []
     st.session_state.model = build_lstm()
@@ -157,59 +110,43 @@ if "init" not in st.session_state:
             st.session_state.markov[st.session_state.prev][r] += 1
         st.session_state.prev = r
 
-# =========================
-# PREDICTION
-# =========================
+# ================= PREDICTION =================
 def lstm_prob():
-    if len(st.session_state.X) < 20 or len(st.session_state.short) < WINDOW:
+    if len(st.session_state.X) < MIN_LEARN:
         return 0.5
-    seq = np.array(st.session_state.short).reshape(1, WINDOW, 1)
+    seq = np.array(st.session_state.short).reshape(1,WINDOW,1)
     return float(st.session_state.model.predict(seq, verbose=0)[0][0])
 
 def ensemble():
     m = st.session_state.markov[st.session_state.prev]
-    m_prob = m[1] / (m[0] + m[1])
+    m_prob = m[1] / (m[0]+m[1])
     g = st.session_state.global_c
-    g_prob = g[1] / (g[0] + g[1])
+    g_prob = g[1] / (g[0]+g[1])
     l_prob = lstm_prob()
-    p = 0.3*m_prob + 0.2*g_prob + 0.5*l_prob
-    return max(p - st.session_state.loss*0.05, 0)
+    return 0.3*m_prob + 0.2*g_prob + 0.5*l_prob
 
-# =========================
-# DASHBOARD
-# =========================
-st.metric("Loss Streak", st.session_state.loss)
-st.metric("Win Streak", st.session_state.win)
-st.metric("Learned Rounds", len(st.session_state.X))
+# ================= UI =================
+st.metric("Total Learned Rounds", len(st.session_state.X))
 
 prediction = None
-confidence = 0
+confidence = 0.0
+note = "LEARNING"
 
 if st.session_state.prev is not None:
     if len(st.session_state.X) < MIN_LEARN:
-        st.info(f"Learning mode… Add {MIN_LEARN - len(st.session_state.X)} more results")
+        st.info("⏳ WAIT FOR PATTERN (Learning...)")
     else:
         confidence = ensemble()
-        prediction = "BIG" if confidence >= 0.5 else "SMALL"
+        if confidence >= CONF_THRESHOLD:
+            prediction = "BIG" if confidence >= 0.5 else "SMALL"
+            note = "PREDICTION"
+            st.success(f"🎯 Prediction: {prediction}")
+            st.write(f"Confidence: {confidence*100:.2f}%")
+        else:
+            st.warning("⏳ WAIT FOR PATTERN")
+            note = "LOW_CONFIDENCE"
 
-        st.subheader("Prediction")
-        st.write("Result:", prediction)
-        st.write("Confidence:", f"{confidence*100:.2f}%")
-
-        if confidence < 0.5:
-            st.error("🚫 DON'T BET (Low Confidence)")
-        elif st.session_state.loss >= 4:
-            play(SOUND_STOP)
-            st.error("⛔ VERY HIGH RISK")
-        elif st.session_state.loss >= 2:
-            play(SOUND_WARN)
-            st.warning("⚠️ CAUTION")
-        elif confidence >= 0.7:
-            play(SOUND_HIGH)
-
-# =========================
-# INPUT ACTUAL RESULT
-# =========================
+# ================= INPUT =================
 st.subheader("Enter Actual Result")
 c1, c2 = st.columns(2)
 actual = None
@@ -229,49 +166,42 @@ if actual is not None:
         st.session_state.X.append(list(st.session_state.short))
         st.session_state.y.append(actual)
         if len(st.session_state.X) % 10 == 0:
-            X = np.array(st.session_state.X).reshape(-1, WINDOW, 1)
+            X = np.array(st.session_state.X).reshape(-1,WINDOW,1)
             y = np.array(st.session_state.y)
             st.session_state.model.fit(X, y, epochs=3, verbose=0)
 
-    outcome = "LEARN"
-    if prediction:
-        if (prediction == "BIG" and actual == 1) or (prediction == "SMALL" and actual == 0):
-            st.session_state.win += 1
-            st.session_state.loss = 0
-            outcome = "WIN"
-        else:
-            st.session_state.loss += 1
-            st.session_state.win = 0
-            outcome = "LOSS"
-
     cur.execute(
-        "INSERT INTO reports VALUES (?,?,?,?,?,?,?)",
-        (st.session_state.user, str(datetime.now()), prediction, confidence*100,
-         "BIG" if actual==1 else "SMALL", outcome, st.session_state.loss)
+        "INSERT INTO reports VALUES (?,?,?,?,?,?)",
+        (st.session_state.user, str(datetime.now()),
+         confidence*100, prediction,
+         "BIG" if actual==1 else "SMALL",
+         note)
     )
     conn.commit()
 
     st.session_state.prev = actual
-    st.success("Saved & learned")
+    st.success("Saved & learning continues")
 
-# =========================
-# EXCEL EXPORT
-# =========================
+# ================= EXCEL EXPORT (FIXED) =================
 st.divider()
 st.subheader("📊 Download Excel Report")
 
-cur.execute("SELECT time,prediction,confidence,actual,outcome,loss_streak FROM reports WHERE username=?",
+cur.execute("""SELECT time,confidence,prediction,actual,note
+               FROM reports WHERE username=?""",
             (st.session_state.user,))
 rows = cur.fetchall()
 
 if rows:
-    df = pd.DataFrame(rows, columns=[
-        "Time", "Prediction", "Confidence", "Actual", "Outcome", "Loss Streak"
-    ])
+    df = pd.DataFrame(rows, columns=["Time","Confidence","Prediction","Actual","Note"])
+    output = BytesIO()
+    df.to_excel(output, index=False, engine="xlsxwriter")
+    output.seek(0)
+
     st.download_button(
         "⬇️ Download Excel",
-        df.to_excel(index=False),
-        file_name="prediction_report.xlsx"
+        data=output,
+        file_name="prediction_report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
 else:
-    st.info("No data to export yet.")
+    st.info("No report data yet.")
