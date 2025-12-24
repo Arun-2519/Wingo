@@ -11,8 +11,9 @@ from io import StringIO
 
 # ================= CONFIG =================
 WINDOW = 10
-MIN_LEARN = 20
-CONF_THRESHOLD = 0.65
+MIN_START = 15
+FULL_START = 20
+BASE_THRESHOLD = 0.65
 STABILITY_THRESHOLD = 0.60
 DB_NAME = "users_ai.db"
 
@@ -35,10 +36,11 @@ cur.execute("""CREATE TABLE IF NOT EXISTS reports (
     time TEXT,
     confidence REAL,
     stability REAL,
+    threshold REAL,
     prediction TEXT,
     actual TEXT,
-    note TEXT)""")
-
+    result_status TEXT
+)""")
 conn.commit()
 
 # ================= UTILS =================
@@ -98,7 +100,7 @@ if st.button("Logout"):
     st.session_state.clear()
     st.rerun()
 
-# ================= INIT USER MEMORY =================
+# ================= INIT =================
 if "init" not in st.session_state:
     st.session_state.init = True
     st.session_state.short = deque(maxlen=WINDOW)
@@ -108,6 +110,7 @@ if "init" not in st.session_state:
     st.session_state.X, st.session_state.y = [], []
     st.session_state.model = build_lstm()
     st.session_state.pending_prediction = None
+    st.session_state.recent_results = deque(maxlen=10)
 
     cur.execute("SELECT result FROM history WHERE username=?", (st.session_state.user,))
     for (r,) in cur.fetchall():
@@ -119,7 +122,7 @@ if "init" not in st.session_state:
 
 # ================= MODEL HELPERS =================
 def lstm_prob():
-    if len(st.session_state.X) < MIN_LEARN:
+    if len(st.session_state.X) < FULL_START:
         return 0.5
     seq = np.array(st.session_state.short).reshape(1,WINDOW,1)
     return float(st.session_state.model.predict(seq, verbose=0)[0][0])
@@ -134,37 +137,49 @@ def ensemble_prob():
 
 def pattern_stability():
     m = st.session_state.markov[st.session_state.prev]
-    total = m[0] + m[1]
-    return max(m[0], m[1]) / total
+    return max(m[0], m[1]) / (m[0]+m[1])
+
+def adaptive_threshold():
+    if not st.session_state.recent_results:
+        return BASE_THRESHOLD
+    loss_rate = st.session_state.recent_results.count("LOSS") / len(st.session_state.recent_results)
+    thr = BASE_THRESHOLD + (loss_rate - 0.5) * 0.2
+    return min(max(thr, 0.55), 0.75)
 
 # ================= UI =================
-st.metric("Learned Rounds", len(st.session_state.X))
+learned = len(st.session_state.X)
+st.metric("Learned Patterns", learned)
 
 prediction = None
 confidence = 0.0
 stability = 0.0
-note = "LEARNING"
+threshold = adaptive_threshold()
 
 if st.session_state.prev is not None:
-    if len(st.session_state.X) < MIN_LEARN:
-        st.info("⏳ WAIT FOR PATTERN (Learning...)")
+
+    if learned < MIN_START:
+        st.info("⏳ Learning phase (need 15 results)")
         st.audio(SOUND_WAIT)
+
+    elif learned < FULL_START:
+        st.warning("⚠️ Soft learning (observing patterns)")
+        st.audio(SOUND_WAIT)
+
     else:
         confidence = ensemble_prob()
         stability = pattern_stability()
 
-        if confidence >= CONF_THRESHOLD and stability >= STABILITY_THRESHOLD:
+        if confidence >= threshold and stability >= STABILITY_THRESHOLD:
             prediction = "BIG" if confidence >= 0.5 else "SMALL"
             st.session_state.pending_prediction = prediction
-            note = "READY"
 
             st.success(f"🎯 Prediction: {prediction}")
             st.write(f"Confidence: {confidence*100:.2f}%")
+            st.write(f"Adaptive Threshold: {threshold*100:.2f}%")
             st.write(f"Pattern Stability: {stability:.2f}")
             st.audio(SOUND_HIGH)
         else:
-            note = "WAIT"
-            st.warning("⚠️ WAIT FOR PATTERN")
+            st.warning("⏳ WAIT FOR STRONG PATTERN")
             st.audio(SOUND_WARN)
 
 # ================= CONFIRM & LEARN =================
@@ -173,6 +188,12 @@ actual = st.selectbox("Enter actual result", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
     actual_val = 1 if actual == "BIG" else 0
+
+    if st.session_state.pending_prediction is None:
+        result_status = "WAIT"
+    else:
+        result_status = "WIN" if st.session_state.pending_prediction == actual else "LOSS"
+        st.session_state.recent_results.append(result_status)
 
     cur.execute("INSERT INTO history VALUES (?,?)", (st.session_state.user, actual_val))
     conn.commit()
@@ -191,31 +212,31 @@ if st.button("Confirm & Learn"):
             st.session_state.model.fit(X, y, epochs=3, verbose=0)
 
     cur.execute(
-        "INSERT INTO reports VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO reports VALUES (?,?,?,?,?,?,?,?)",
         (st.session_state.user, str(datetime.now()),
-         confidence*100, stability,
-         st.session_state.pending_prediction,
-         actual, note)
+         confidence*100, stability, threshold*100,
+         st.session_state.pending_prediction, actual, result_status)
     )
     conn.commit()
 
     st.session_state.prev = actual_val
     st.session_state.pending_prediction = None
-    st.success("Saved & model learned")
+    st.success(f"Saved ✔ Result: {result_status}")
 
-# ================= CSV EXPORT (SAFE) =================
+# ================= CSV EXPORT =================
 st.divider()
 st.subheader("📊 Download Report (CSV)")
 
 cur.execute("""
-SELECT time, confidence, stability, prediction, actual, note
+SELECT time, confidence, stability, threshold, prediction, actual, result_status
 FROM reports WHERE username=?
 """, (st.session_state.user,))
 rows = cur.fetchall()
 
 if rows:
     df = pd.DataFrame(rows, columns=[
-        "Time","Confidence","Pattern Stability","Prediction","Actual","Note"
+        "Time","Confidence","Pattern Stability","Adaptive Threshold",
+        "Prediction","Actual","Result"
     ])
     csv_buf = StringIO()
     df.to_csv(csv_buf, index=False)
