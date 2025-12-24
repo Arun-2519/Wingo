@@ -1,7 +1,6 @@
 import streamlit as st
 import numpy as np
-import sqlite3, hashlib
-from collections import deque
+from collections import defaultdict, deque
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense
 from tensorflow.keras.optimizers import Adam
@@ -11,114 +10,109 @@ import pandas as pd
 
 # ================= CONFIG =================
 MIN_DATA = 15
-PATTERN_WINDOW = 5
-DB_NAME = "users_ai.db"
+SHORT_WIN = 5
+LONG_WIN = 15
+DB_MAX = 200
 
 st.set_page_config(page_title="AI Wingo Predictor", layout="centered")
-
-# ================= DB =================
-conn = sqlite3.connect(DB_NAME, check_same_thread=False)
-cur = conn.cursor()
-
-cur.execute("""CREATE TABLE IF NOT EXISTS history (
-    username TEXT,
-    result INTEGER
-)""")
-
-cur.execute("""DROP TABLE IF EXISTS reports""")
-cur.execute("""CREATE TABLE reports (
-    time TEXT,
-    prediction TEXT,
-    actual TEXT,
-    confidence REAL,
-    result TEXT
-)""")
-conn.commit()
-
-# ================= MODEL =================
-def build_lstm():
-    m = Sequential([
-        LSTM(32, input_shape=(10,1)),
-        Dense(1, activation="sigmoid")
-    ])
-    m.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
-    return m
 
 # ================= SESSION =================
 if "seq" not in st.session_state:
     st.session_state.seq = []
+if "markov" not in st.session_state:
+    st.session_state.markov = defaultdict(lambda: defaultdict(int))
 if "model" not in st.session_state:
-    st.session_state.model = build_lstm()
+    model = Sequential([
+        LSTM(32, input_shape=(10,1)),
+        Dense(1, activation="sigmoid")
+    ])
+    model.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
+    st.session_state.model = model
 if "X" not in st.session_state:
-    st.session_state.X = []
-if "y" not in st.session_state:
-    st.session_state.y = []
+    st.session_state.X, st.session_state.y = [], []
+if "log" not in st.session_state:
+    st.session_state.log = []
+if "pending_actual" not in st.session_state:
+    st.session_state.pending_actual = None
 
 # ================= HELPERS =================
-def lstm_prob():
-    if len(st.session_state.seq) < 10:
-        return 0.5
-    seq = np.array(st.session_state.seq[-10:]).reshape(1,10,1)
-    return float(st.session_state.model.predict(seq, verbose=0)[0][0])
-
-def recent_pattern(seq):
-    w = seq[-PATTERN_WINDOW:]
-    b = w.count(1)
-    s = w.count(0)
-    if b >= 3:
-        return "BIG", b/5
-    if s >= 3:
-        return "SMALL", s/5
+def pattern_score(seq, window):
+    w = seq[-window:]
+    b, s = w.count(1), w.count(0)
+    if b > s:
+        return "BIG", b / window
+    if s > b:
+        return "SMALL", s / window
     return None, 0
 
-def recent_balance(seq):
-    w = seq[-15:]
-    if not w:
+def markov_prob(seq):
+    if len(seq) < 2:
         return 0.5
-    return 1 - abs(w.count(1) - w.count(0)) / len(w)
+    prev = seq[-1]
+    nxt = st.session_state.markov[prev]
+    total = nxt[0] + nxt[1]
+    if total == 0:
+        return 0.5
+    return nxt[1] / total
+
+def lstm_prob(seq):
+    if len(seq) < 10:
+        return 0.5
+    x = np.array(seq[-10:]).reshape(1,10,1)
+    return float(st.session_state.model.predict(x, verbose=0)[0][0])
 
 # ================= UI =================
-st.title("🧠 AI Wingo Predictor")
-
+st.title("🧠 AI Wingo Predictor (Markov + LSTM + Pattern AI)")
 st.metric("Total Data", len(st.session_state.seq))
 
-prediction = None
-confidence = 0
+prediction, confidence = None, 0
 
 if len(st.session_state.seq) >= MIN_DATA:
-    pat, pat_strength = recent_pattern(st.session_state.seq)
+    sp, ss = pattern_score(st.session_state.seq, SHORT_WIN)
+    lp, ls = pattern_score(st.session_state.seq, LONG_WIN)
 
-    if pat:
-        lstm_p = lstm_prob()
-        bal = recent_balance(st.session_state.seq)
+    if sp and lp and sp == lp:
+        mp = markov_prob(st.session_state.seq)
+        lpb = lstm_prob(st.session_state.seq)
 
-        raw_conf = (
-            0.5 * pat_strength +
-            0.3 * lstm_p +
-            0.2 * bal
+        final_score = (
+            0.30 * ss +
+            0.25 * ls +
+            0.25 * mp +
+            0.20 * lpb
         )
 
-        confidence = int(60 + raw_conf * 40)  # 60–100%
+        confidence = int(60 + final_score * 40)
 
-        if confidence >= 60:
-            prediction = pat
+        if confidence >= 60 and mp >= 0.55:
+            prediction = sp
             st.success(f"🎯 Prediction: {prediction}")
             st.write(f"Confidence: {confidence}%")
+            st.write(f"Markov Next-State Prob: {mp:.2f}")
         else:
-            st.warning("⏳ WAIT (Low Confidence)")
+            st.warning("⏳ WAIT (Weak transition confidence)")
     else:
-        st.warning("⏳ WAIT (No clear pattern)")
+        st.warning("⏳ WAIT (Pattern disagreement)")
 else:
     st.info("⏳ Learning… need 15 data")
 
-# ================= CONFIRM =================
+# ================= CONFIRM & LEARN (BUG FIXED) =================
 st.subheader("Confirm & Learn")
-actual = st.selectbox("Actual Result", ["BIG", "SMALL"])
 
-if st.button("Confirm"):
+actual = st.radio("Actual Result (temporary)", ["BIG", "SMALL"])
+
+if st.button("Confirm & Learn"):
     val = 1 if actual == "BIG" else 0
-    st.session_state.seq.append(val)
 
+    # Markov update (AFTER confirmation only)
+    if st.session_state.seq:
+        prev = st.session_state.seq[-1]
+        st.session_state.markov[prev][val] += 1
+
+    st.session_state.seq.append(val)
+    st.session_state.seq = st.session_state.seq[-DB_MAX:]
+
+    # LSTM training
     if len(st.session_state.seq) >= 10:
         st.session_state.X.append(st.session_state.seq[-10:])
         st.session_state.y.append(val)
@@ -127,24 +121,24 @@ if st.button("Confirm"):
             y = np.array(st.session_state.y)
             st.session_state.model.fit(X, y, epochs=2, verbose=0)
 
+    result = "WAIT"
     if prediction:
         result = "WIN" if prediction == actual else "LOSS"
-    else:
-        result = "WAIT"
 
-    cur.execute("INSERT INTO reports VALUES (?,?,?,?,?)",
-                (str(datetime.now()), prediction, actual, confidence, result))
-    conn.commit()
+    st.session_state.log.append({
+        "Time": datetime.now(),
+        "Prediction": prediction,
+        "Actual": actual,
+        "Confidence": confidence,
+        "Result": result
+    })
 
     st.success(f"Saved → {result}")
 
 # ================= CSV =================
 st.divider()
-cur.execute("SELECT * FROM reports")
-rows = cur.fetchall()
-
-if rows:
-    df = pd.DataFrame(rows, columns=["Time","Prediction","Actual","Confidence","Result"])
+if st.session_state.log:
+    df = pd.DataFrame(st.session_state.log)
     buf = StringIO()
     df.to_csv(buf, index=False)
-    st.download_button("⬇️ Download CSV", buf.getvalue(), "wingo_report.csv")
+    st.download_button("⬇️ Download CSV", buf.getvalue(), "wingo_ai_report.csv")
