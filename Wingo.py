@@ -7,7 +7,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 import pandas as pd
 from datetime import datetime
-from io import BytesIO
+from io import StringIO
 
 # ================= CONFIG =================
 WINDOW = 10
@@ -45,7 +45,7 @@ conn.commit()
 def hash_pw(pw):
     return hashlib.sha256(pw.encode()).hexdigest()
 
-# ================= SOUND (SAFE URLs) =================
+# ================= SOUND =================
 SOUND_HIGH = "https://actions.google.com/sounds/v1/cartoon/clang_and_wobble.ogg"
 SOUND_WARN = "https://actions.google.com/sounds/v1/alarms/warning.ogg"
 SOUND_WAIT = "https://actions.google.com/sounds/v1/alarms/beep_short.ogg"
@@ -133,12 +133,9 @@ def ensemble_prob():
     return 0.3*m_prob + 0.2*g_prob + 0.5*l_prob
 
 def pattern_stability():
-    if st.session_state.prev is None:
-        return 0.0
     m = st.session_state.markov[st.session_state.prev]
     total = m[0] + m[1]
-    dominant = max(m[0], m[1]) / total
-    return dominant
+    return max(m[0], m[1]) / total
 
 # ================= UI =================
 st.metric("Learned Rounds", len(st.session_state.X))
@@ -167,12 +164,11 @@ if st.session_state.prev is not None:
             st.audio(SOUND_HIGH)
         else:
             note = "WAIT"
-            st.warning("⚠️ WAIT FOR PATTERN (Unstable or Low Confidence)")
+            st.warning("⚠️ WAIT FOR PATTERN")
             st.audio(SOUND_WARN)
 
 # ================= CONFIRM & LEARN =================
 st.subheader("Confirm & Learn")
-
 actual = st.selectbox("Enter actual result", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
@@ -205,11 +201,11 @@ if st.button("Confirm & Learn"):
 
     st.session_state.prev = actual_val
     st.session_state.pending_prediction = None
-    st.success("Saved & model learned from result")
+    st.success("Saved & model learned")
 
-# ================= EXCEL EXPORT =================
+# ================= CSV EXPORT (SAFE) =================
 st.divider()
-st.subheader("📊 Download Excel Report")
+st.subheader("📊 Download Report (CSV)")
 
 cur.execute("""
 SELECT time, confidence, stability, prediction, actual, note
@@ -221,14 +217,14 @@ if rows:
     df = pd.DataFrame(rows, columns=[
         "Time","Confidence","Pattern Stability","Prediction","Actual","Note"
     ])
-    buf = BytesIO()
-    df.to_excel(buf, index=False)
-    buf.seek(0)
+    csv_buf = StringIO()
+    df.to_csv(csv_buf, index=False)
 
     st.download_button(
-        "⬇️ Download Excel",
-        data=buf.getvalue(),
-        file_name="prediction_report.xlsx"
+        "⬇️ Download CSV",
+        data=csv_buf.getvalue(),
+        file_name="prediction_report.csv",
+        mime="text/csv"
     )
 else:
     st.info("No data yet.")
