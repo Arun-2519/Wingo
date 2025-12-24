@@ -21,22 +21,34 @@ st.set_page_config(page_title="AI Wingo Predictor", layout="centered")
 conn = sqlite3.connect(DB_NAME, check_same_thread=False)
 cur = conn.cursor()
 
-cur.execute("""CREATE TABLE IF NOT EXISTS users (
+# USERS
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
     username TEXT PRIMARY KEY,
-    password TEXT)""")
+    password TEXT
+)
+""")
 
-cur.execute("""CREATE TABLE IF NOT EXISTS history (
+# HISTORY
+cur.execute("""
+CREATE TABLE IF NOT EXISTS history (
     username TEXT,
-    result INTEGER)""")
+    result INTEGER
+)
+""")
 
-cur.execute("""CREATE TABLE IF NOT EXISTS reports (
+# REPORTS (DROP & RECREATE SAFELY)
+cur.execute("DROP TABLE IF EXISTS reports")
+cur.execute("""
+CREATE TABLE reports (
     username TEXT,
     time TEXT,
     confidence REAL,
     prediction TEXT,
     actual TEXT,
-    note TEXT)""")
-
+    note TEXT
+)
+""")
 conn.commit()
 
 # ================= UTILS =================
@@ -78,7 +90,7 @@ def login_ui():
             conn.commit()
             st.success("Account created. Login now.")
         except:
-            st.error("Username exists")
+            st.error("Username already exists")
 
 # ================= APP START =================
 st.title("🧠 AI Wingo Predictor")
@@ -102,8 +114,7 @@ if "init" not in st.session_state:
     st.session_state.model = build_lstm()
 
     cur.execute("SELECT result FROM history WHERE username=?", (st.session_state.user,))
-    for r in cur.fetchall():
-        r = r[0]
+    for (r,) in cur.fetchall():
         st.session_state.short.append(r)
         st.session_state.global_c[r] += 1
         if st.session_state.prev is not None:
@@ -143,8 +154,8 @@ if st.session_state.prev is not None:
             st.success(f"🎯 Prediction: {prediction}")
             st.write(f"Confidence: {confidence*100:.2f}%")
         else:
-            st.warning("⏳ WAIT FOR PATTERN")
             note = "LOW_CONFIDENCE"
+            st.warning("⏳ WAIT FOR PATTERN")
 
 # ================= INPUT =================
 st.subheader("Enter Actual Result")
@@ -182,24 +193,25 @@ if actual is not None:
     st.session_state.prev = actual
     st.success("Saved & learning continues")
 
-# ================= EXCEL EXPORT (FIXED) =================
+# ================= EXCEL EXPORT =================
 st.divider()
 st.subheader("📊 Download Excel Report")
 
-cur.execute("""SELECT time,confidence,prediction,actual,note
-               FROM reports WHERE username=?""",
-            (st.session_state.user,))
+cur.execute("""
+SELECT time, confidence, prediction, actual, note
+FROM reports WHERE username=?
+""", (st.session_state.user,))
 rows = cur.fetchall()
 
 if rows:
     df = pd.DataFrame(rows, columns=["Time","Confidence","Prediction","Actual","Note"])
-    output = BytesIO()
-    df.to_excel(output, index=False, engine="xlsxwriter")
-    output.seek(0)
+    buffer = BytesIO()
+    df.to_excel(buffer, index=False, engine="xlsxwriter")
+    buffer.seek(0)
 
     st.download_button(
         "⬇️ Download Excel",
-        data=output,
+        data=buffer,
         file_name="prediction_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
