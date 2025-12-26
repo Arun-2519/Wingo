@@ -40,7 +40,7 @@ if "history" not in st.session_state:
 
 if "pattern_stats" not in st.session_state:
     raw = load_json(PATTERN_FILE, {})
-    st.session_state.pattern_stats = defaultdict(lambda: defaultdict(lambda: [0,0]))
+    st.session_state.pattern_stats = defaultdict(lambda: defaultdict(lambda: [0, 0]))
     for k, v in raw.items():
         st.session_state.pattern_stats[tuple(eval(k))] = v
 
@@ -59,7 +59,7 @@ if "cooldown" not in st.session_state:
 if "post_loss_wait" not in st.session_state:
     st.session_state.post_loss_wait = 0
 
-# reset daily counter automatically
+# reset daily counter
 if st.session_state.today_date != str(date.today()):
     st.session_state.today_date = str(date.today())
     st.session_state.today_inputs = 0
@@ -69,9 +69,9 @@ def entropy(seq):
     if not seq:
         return 1
     p = seq.count("BIG") / len(seq)
-    if p in [0,1]:
+    if p in (0, 1):
         return 0
-    return -p*math.log2(p)-(1-p)*math.log2(1-p)
+    return -p * math.log2(p) - (1 - p) * math.log2(1 - p)
 
 def detect_chop(seq):
     if len(seq) < 6:
@@ -79,14 +79,15 @@ def detect_chop(seq):
     return entropy(seq[-6:]) > 0.9
 
 def extract_patterns(seq):
-    pats = []
+    patterns = []
     for k in range(3, 9):  # short + long patterns
         if len(seq) >= k:
-            pats.append(tuple(seq[-k:]))
-    return pats
+            patterns.append(tuple(seq[-k:]))
+    return patterns
 
 # ================= PREDICTION =================
-prediction, confidence = None, 0
+prediction = None
+confidence = 0
 history = st.session_state.history
 
 if st.session_state.cooldown > 0:
@@ -104,9 +105,9 @@ elif len(history) >= MIN_TOTAL_DATA and st.session_state.today_inputs >= DAILY_W
 
         for pat in extract_patterns(history):
             stats = st.session_state.pattern_stats.get(pat, {})
-            for res, (win, tot) in stats.items():
-                if tot >= 3:
-                    conf = win / tot
+            for res, (win, total) in stats.items():
+                if total >= 3:
+                    conf = win / total
                     candidates.append((res, conf))
 
         if candidates:
@@ -125,19 +126,20 @@ else:
     st.warning("🕐 Warming up with today’s data...")
 
 # ================= INPUT =================
-actual = st.selectbox("Enter Actual Result", ["BIG","SMALL"])
+actual = st.selectbox("Enter Actual Result", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
 
     if st.session_state.cooldown > 0:
         st.session_state.cooldown -= 1
+
     if st.session_state.post_loss_wait > 0:
         st.session_state.post_loss_wait -= 1
 
     st.session_state.history.append(actual)
     st.session_state.today_inputs += 1
 
-    # update pattern stats using past window
+    # update pattern stats
     for pat in extract_patterns(st.session_state.history[:-1]):
         if prediction:
             st.session_state.pattern_stats[pat][prediction][1] += 1
@@ -157,7 +159,7 @@ if st.button("Confirm & Learn"):
                 st.session_state.cooldown = COOLDOWN_ROUNDS
 
     save_json(HISTORY_FILE, st.session_state.history)
-    save_json(PATTERN_FILE, {str(k):v for k,v in st.session_state.pattern_stats.items()})
+    save_json(PATTERN_FILE, {str(k): v for k, v in st.session_state.pattern_stats.items()})
 
     st.success(f"Saved → {result}")
     st.rerun()
@@ -169,4 +171,3 @@ if st.session_state.history:
     st.dataframe(df.tail(50))
 
 st.caption("Persistent AI • Short & Long Pattern Memory • Day-by-Day Learning")
-
