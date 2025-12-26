@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 from collections import defaultdict, deque
 from io import BytesIO
-
 from sklearn.naive_bayes import MultinomialNB
 
 # ================= CONFIG =================
@@ -37,13 +36,11 @@ if "log" not in st.session_state:
 if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
 
-# ordered pattern memory (3–5)
 if "patterns" not in st.session_state:
     st.session_state.patterns = {
         k: defaultdict(lambda: defaultdict(int)) for k in range(3, 6)
     }
 
-# performance tracking (auto-disable logic)
 if "model_perf" not in st.session_state:
     st.session_state.model_perf = deque(maxlen=10)
 
@@ -53,9 +50,6 @@ DEC = {0: "SMALL", 1: "BIG"}
 
 def encode(seq):
     return [ENC[s] for s in seq]
-
-def decode(v):
-    return DEC.get(v, "")
 
 def auto_threshold():
     if len(st.session_state.model_perf) < 5:
@@ -67,7 +61,6 @@ def regime_shift(seq):
     if len(seq) < 8:
         return False
     last = seq[-8:]
-    # unstable if nearly equal BIG/SMALL
     return abs(last.count("BIG") - last.count("SMALL")) <= 1
 
 def learn_patterns(seq):
@@ -88,28 +81,31 @@ def pattern_signal(seq):
                 return best, counts[best] / total
     return None, 0
 
-# ================= PREDICTION =================
+# ================= PREDICTION (PAST DATA ONLY) =================
 prediction, confidence = None, 0
 conf_threshold = auto_threshold()
-regime = regime_shift(st.session_state.inputs)
 
-if len(st.session_state.inputs) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
+history = st.session_state.inputs.copy()  # 🔒 freeze past only
+regime = regime_shift(history)
+
+if len(history) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
 
     signals = []
 
     # ---- Pattern AI ----
-    p_pred, p_strength = pattern_signal(st.session_state.inputs)
+    p_pred, p_strength = pattern_signal(history)
     if p_pred:
         signals.append((p_pred, p_strength))
 
-    # ---- Naive Bayes ----
+    # ---- Naive Bayes (trained only on past windows) ----
     if len(st.session_state.X_train) >= 10:
         clf = MultinomialNB()
         clf.fit(st.session_state.X_train, st.session_state.y_train)
-        encoded = encode(st.session_state.inputs[-10:])
+
+        encoded = encode(history[-10:])
         probs = clf.predict_proba([encoded])[0]
         idx = np.argmax(probs)
-        signals.append((decode(idx), probs[idx]))
+        signals.append((DEC[idx], probs[idx]))
 
     if signals:
         preds = [s[0] for s in signals]
@@ -132,17 +128,18 @@ if len(st.session_state.inputs) >= MIN_DATA and st.session_state.loss_streak < L
 else:
     st.warning("🔒 PROFIT PROTECTION ACTIVE")
 
-# ================= INPUT UI =================
+# ================= INPUT UI (NO LEAK) =================
 st.subheader("🎮 Add Actual Result")
 actual = st.selectbox("Select actual result (temporary)", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
-    # ---- Learn ONLY here ----
+    # ✅ Now we add the actual result
     st.session_state.inputs.append(actual)
 
-    if len(st.session_state.inputs) >= 10:
+    # Train NB only after confirm
+    if len(st.session_state.inputs) >= 11:
         st.session_state.X_train.append(
-            encode(st.session_state.inputs[-10:])
+            encode(st.session_state.inputs[-11:-1])
         )
         st.session_state.y_train.append(ENC[actual])
 
@@ -174,11 +171,7 @@ if st.session_state.log:
 
     buf = BytesIO()
     df.to_excel(buf, index=False)
-    st.download_button(
-        "⬇️ Download Excel",
-        buf.getvalue(),
-        "big_small_ai.xlsx"
-    )
+    st.download_button("⬇️ Download Excel", buf.getvalue(), "big_small_ai_fixed.xlsx")
 
 st.markdown("---")
-st.caption("Built with ❤️ using Streamlit, Naive Bayes, Pattern AI & Self-Regulation")
+st.caption("Built with ❤️ using Streamlit, Naive Bayes, Pattern AI & Proper ML Discipline")
