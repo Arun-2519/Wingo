@@ -1,38 +1,54 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from collections import deque
+from collections import defaultdict
 from io import BytesIO
-from sklearn.naive_bayes import MultinomialNB
+import json, os, math
+from datetime import date
 
 # ================= CONFIG =================
-MIN_DATA = 10
-BASE_CONF = 65
-LOSS_LIMIT = 2          # losses before cooldown
-COOLDOWN_ROUNDS = 2     # wait rounds after loss cluster
+MIN_TOTAL_DATA = 10          # overall minimum
+DAILY_WARMUP = 5             # new inputs required each day
+MIN_CONF = 60
+LOSS_LIMIT = 2
+COOLDOWN_ROUNDS = 2
+POST_LOSS_WAIT = 1
+
+DATA_DIR = "ai_memory"
+HISTORY_FILE = f"{DATA_DIR}/history.json"
+PATTERN_FILE = f"{DATA_DIR}/pattern_stats.json"
+
+os.makedirs(DATA_DIR, exist_ok=True)
 
 st.set_page_config(page_title="🔵🔴 BIG vs SMALL AI", layout="centered")
-st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (STABLE & SAFE)")
+st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (LONG-TERM LEARNING)")
 
-st.markdown("""
-<style>
-body { background-color: #0f1117; color: #ffffff; }
-.stButton>button { background-color: #2196f3; color: white; font-weight: bold; }
-</style>
-""", unsafe_allow_html=True)
+# ================= LOAD / SAVE =================
+def load_json(path, default):
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return default
+
+def save_json(path, data):
+    with open(path, "w") as f:
+        json.dump(data, f)
 
 # ================= SESSION STATE =================
-if "inputs" not in st.session_state:
-    st.session_state.inputs = []
+if "history" not in st.session_state:
+    st.session_state.history = load_json(HISTORY_FILE, [])
 
-if "X_train" not in st.session_state:
-    st.session_state.X_train = []
+if "pattern_stats" not in st.session_state:
+    raw = load_json(PATTERN_FILE, {})
+    st.session_state.pattern_stats = defaultdict(lambda: defaultdict(lambda: [0,0]))
+    for k, v in raw.items():
+        st.session_state.pattern_stats[tuple(eval(k))] = v
 
-if "y_train" not in st.session_state:
-    st.session_state.y_train = []
+if "today_date" not in st.session_state:
+    st.session_state.today_date = str(date.today())
 
-if "log" not in st.session_state:
-    st.session_state.log = []
+if "today_inputs" not in st.session_state:
+    st.session_state.today_inputs = 0
 
 if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
@@ -40,155 +56,116 @@ if "loss_streak" not in st.session_state:
 if "cooldown" not in st.session_state:
     st.session_state.cooldown = 0
 
-if "model_perf" not in st.session_state:
-    st.session_state.model_perf = deque(maxlen=10)
+if "post_loss_wait" not in st.session_state:
+    st.session_state.post_loss_wait = 0
+
+# reset daily counter automatically
+if st.session_state.today_date != str(date.today()):
+    st.session_state.today_date = str(date.today())
+    st.session_state.today_inputs = 0
 
 # ================= HELPERS =================
-ENC = {"SMALL": 0, "BIG": 1}
-DEC = {0: "SMALL", 1: "BIG"}
-
-def encode(seq):
-    return [ENC[s] for s in seq]
-
-def auto_threshold():
-    if len(st.session_state.model_perf) < 5:
-        return BASE_CONF
-    acc = sum(st.session_state.model_perf) / len(st.session_state.model_perf)
-    return int(np.clip(BASE_CONF + (0.55 - acc) * 25, 65, 80))
-
-def current_streak(seq):
+def entropy(seq):
     if not seq:
-        return None, 0
-    last = seq[-1]
-    length = 1
-    for i in range(len(seq) - 2, -1, -1):
-        if seq[i] == last:
-            length += 1
-        else:
-            break
-    return last, length
+        return 1
+    p = seq.count("BIG") / len(seq)
+    if p in [0,1]:
+        return 0
+    return -p*math.log2(p)-(1-p)*math.log2(1-p)
 
-def alternation_signal(seq):
-    if len(seq) < 3:
-        return None, 0
-    a, b, c = seq[-3:]
-    if a == c and a != b:
-        return b, 0.75   # strong alternation
-    return None, 0
+def detect_chop(seq):
+    if len(seq) < 6:
+        return True
+    return entropy(seq[-6:]) > 0.9
 
-# ================= PREDICTION (PAST ONLY) =================
+def extract_patterns(seq):
+    pats = []
+    for k in range(3, 9):  # short + long patterns
+        if len(seq) >= k:
+            pats.append(tuple(seq[-k:]))
+    return pats
+
+# ================= PREDICTION =================
 prediction, confidence = None, 0
-conf_threshold = auto_threshold()
-history = st.session_state.inputs.copy()
+history = st.session_state.history
 
 if st.session_state.cooldown > 0:
-    st.warning(f"⏳ COOLDOWN ACTIVE ({st.session_state.cooldown} rounds left)")
-elif len(history) >= MIN_DATA:
+    st.warning(f"⏳ COOLDOWN ({st.session_state.cooldown})")
 
-    signals = []
+elif st.session_state.post_loss_wait > 0:
+    st.warning("⏳ WAIT (post-loss stabilization)")
 
-    # ---- Alternation (PRIMARY) ----
-    alt_pred, alt_conf = alternation_signal(history)
-    if alt_pred:
-        signals.append((alt_pred, alt_conf))
+elif len(history) >= MIN_TOTAL_DATA and st.session_state.today_inputs >= DAILY_WARMUP:
 
-    # ---- Streak BREAK logic ----
-    last, streak_len = current_streak(history)
-    if streak_len >= 3:
-        opp = "SMALL" if last == "BIG" else "BIG"
-        signals.append((opp, 0.6))
-
-    # ---- Naive Bayes (SUPPORT ONLY) ----
-    if len(st.session_state.X_train) >= 10:
-        clf = MultinomialNB()
-        clf.fit(st.session_state.X_train, st.session_state.y_train)
-        probs = clf.predict_proba([encode(history[-10:])])[0]
-        idx = np.argmax(probs)
-        nb_pred = DEC[idx]
-        nb_conf = min(0.1, probs[idx] * 0.1)  # capped influence
-        signals.append((nb_pred, nb_conf))
-
-    if signals:
-        preds = [s[0] for s in signals]
-        strengths = [s[1] for s in signals]
-
-        prediction = max(set(preds), key=preds.count)
-        confidence = int(60 + sum(strengths) * 40)
-
-        # penalties
-        if streak_len >= 4:
-            confidence -= 20
-        if st.session_state.loss_streak >= 1:
-            confidence -= 10
-
-        if confidence >= conf_threshold:
-            st.success(f"🎯 Prediction: {prediction}")
-            st.write(f"Confidence: {confidence}% (threshold {conf_threshold}%)")
-        else:
-            prediction = None
-            st.warning("⏳ WAIT (low confidence)")
+    if detect_chop(history):
+        st.warning("⏳ WAIT (choppy regime)")
     else:
-        st.warning("⏳ WAIT (no valid pattern)")
-else:
-    st.warning("🕐 Collecting initial data...")
+        candidates = []
 
-# ================= INPUT UI =================
-st.subheader("🎮 Enter Actual Result")
-actual = st.selectbox("Select result (temporary)", ["BIG", "SMALL"])
+        for pat in extract_patterns(history):
+            stats = st.session_state.pattern_stats.get(pat, {})
+            for res, (win, tot) in stats.items():
+                if tot >= 3:
+                    conf = win / tot
+                    candidates.append((res, conf))
+
+        if candidates:
+            best = max(candidates, key=lambda x: x[1])
+            confidence = int(best[1] * 100)
+
+            if confidence >= MIN_CONF:
+                prediction = best[0]
+                st.success(f"🎯 Prediction: {prediction}")
+                st.write(f"Confidence: {confidence}%")
+            else:
+                st.warning("⏳ WAIT (weak historical evidence)")
+        else:
+            st.warning("⏳ WAIT (no stable pattern yet)")
+else:
+    st.warning("🕐 Warming up with today’s data...")
+
+# ================= INPUT =================
+actual = st.selectbox("Enter Actual Result", ["BIG","SMALL"])
 
 if st.button("Confirm & Learn"):
 
-    # reduce cooldown every round
     if st.session_state.cooldown > 0:
         st.session_state.cooldown -= 1
+    if st.session_state.post_loss_wait > 0:
+        st.session_state.post_loss_wait -= 1
 
-    st.session_state.inputs.append(actual)
+    st.session_state.history.append(actual)
+    st.session_state.today_inputs += 1
 
-    # train NB on past window only
-    if len(st.session_state.inputs) >= 11:
-        st.session_state.X_train.append(
-            encode(st.session_state.inputs[-11:-1])
-        )
-        st.session_state.y_train.append(ENC[actual])
+    # update pattern stats using past window
+    for pat in extract_patterns(st.session_state.history[:-1]):
+        if prediction:
+            st.session_state.pattern_stats[pat][prediction][1] += 1
+            if prediction == actual:
+                st.session_state.pattern_stats[pat][prediction][0] += 1
 
     result = "WAIT"
     if prediction:
-        result = "WIN" if prediction == actual else "LOSS"
-
-        if result == "WIN":
+        if prediction == actual:
+            result = "WIN"
             st.session_state.loss_streak = 0
-            st.session_state.model_perf.append(1)
         else:
+            result = "LOSS"
             st.session_state.loss_streak += 1
-            st.session_state.model_perf.append(0)
-
+            st.session_state.post_loss_wait = POST_LOSS_WAIT
             if st.session_state.loss_streak >= LOSS_LIMIT:
                 st.session_state.cooldown = COOLDOWN_ROUNDS
 
-    st.session_state.log.append({
-        "Prediction": prediction,
-        "Confidence": confidence,
-        "Actual": actual,
-        "Result": result,
-        "Cooldown": st.session_state.cooldown
-    })
+    save_json(HISTORY_FILE, st.session_state.history)
+    save_json(PATTERN_FILE, {str(k):v for k,v in st.session_state.pattern_stats.items()})
 
     st.success(f"Saved → {result}")
     st.rerun()
 
-# ================= HISTORY =================
-if st.session_state.log:
-    st.subheader("📊 Prediction History")
-    df = pd.DataFrame(st.session_state.log)
-    st.dataframe(df)
+# ================= HISTORY VIEW =================
+if st.session_state.history:
+    st.subheader("📊 Stored History (Persistent)")
+    df = pd.DataFrame({"Result": st.session_state.history})
+    st.dataframe(df.tail(50))
 
-    buf = BytesIO()
-    df.to_excel(buf, index=False)
-    st.download_button(
-        "⬇️ Download Excel",
-        buf.getvalue(),
-        "big_small_ai_final_safe.xlsx"
-    )
-
-st.markdown("---")
-st.caption("Capital-protected AI: Alternation + Streak-Break + Cooldown Control")
+st.caption("Persistent AI • Short & Long Pattern Memory • Day-by-Day Learning")
