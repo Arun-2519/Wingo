@@ -1,194 +1,184 @@
 import streamlit as st
-import numpy as np
 import pandas as pd
-from collections import defaultdict, deque, Counter
-from datetime import datetime
-from io import StringIO
+import numpy as np
+from collections import defaultdict, deque
+from io import BytesIO
 
 from sklearn.naive_bayes import MultinomialNB
-import tensorflow as tf
-from tensorflow.keras.layers import Dense, Embedding, MultiHeadAttention, LayerNormalization, GlobalAveragePooling1D
-from tensorflow.keras.models import Model
-from tensorflow.keras.optimizers import Adam
 
 # ================= CONFIG =================
 MIN_DATA = 10
 BASE_CONF = 65
-LOSS_LIMIT = 2
-SEQ_MAX = 5
+LOSS_LIMIT = 3
 
-st.set_page_config(page_title="🧠 Heavy AI Predictor", layout="wide")
+st.set_page_config(page_title="🔵🔴 BIG vs SMALL AI", layout="centered")
+st.title("🔵 BIG vs 🔴 SMALL Predictor (AI Powered)")
 
-# ================= SESSION INIT =================
-def init_state():
-    st.session_state.seq = []
+st.markdown("""
+<style>
+body { background-color: #0f1117; color: #ffffff; }
+.stButton>button { background-color: #2196f3; color: white; font-weight: bold; }
+</style>
+""", unsafe_allow_html=True)
+
+# ================= SESSION STATE =================
+if "inputs" not in st.session_state:
+    st.session_state.inputs = []
+
+if "X_train" not in st.session_state:
+    st.session_state.X_train = []
+
+if "y_train" not in st.session_state:
+    st.session_state.y_train = []
+
+if "log" not in st.session_state:
     st.session_state.log = []
+
+if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
 
-    st.session_state.model_perf = {
-        "A": deque(maxlen=10),
-        "B": deque(maxlen=10)
+# ordered pattern memory (3–5)
+if "patterns" not in st.session_state:
+    st.session_state.patterns = {
+        k: defaultdict(lambda: defaultdict(int)) for k in range(3, 6)
     }
 
-    st.session_state.patterns = {k: defaultdict(lambda: defaultdict(int)) for k in range(3,6)}
-    st.session_state.X_nb, st.session_state.y_nb = [], []
-
-if "seq" not in st.session_state:
-    init_state()
-
-# ================= TRANSFORMER =================
-def build_transformer():
-    inp = tf.keras.Input(shape=(SEQ_MAX,))
-    x = Embedding(2, 16)(inp)
-    x = MultiHeadAttention(num_heads=2, key_dim=16)(x, x)
-    x = LayerNormalization()(x)
-    x = GlobalAveragePooling1D()(x)
-    out = Dense(1, activation="sigmoid")(x)
-    model = Model(inp, out)
-    model.compile(optimizer=Adam(0.001), loss="binary_crossentropy")
-    return model
-
-if "transformer" not in st.session_state:
-    st.session_state.transformer = build_transformer()
-    st.session_state.tx, st.session_state.ty = [], []
+# performance tracking (auto-disable logic)
+if "model_perf" not in st.session_state:
+    st.session_state.model_perf = deque(maxlen=10)
 
 # ================= HELPERS =================
+ENC = {"SMALL": 0, "BIG": 1}
+DEC = {0: "SMALL", 1: "BIG"}
+
+def encode(seq):
+    return [ENC[s] for s in seq]
+
+def decode(v):
+    return DEC.get(v, "")
+
 def auto_threshold():
-    all_perf = list(st.session_state.model_perf["A"]) + list(st.session_state.model_perf["B"])
-    if len(all_perf) < 5:
+    if len(st.session_state.model_perf) < 5:
         return BASE_CONF
-    acc = sum(all_perf) / len(all_perf)
+    acc = sum(st.session_state.model_perf) / len(st.session_state.model_perf)
     return int(np.clip(BASE_CONF + (0.6 - acc) * 20, 60, 75))
 
 def regime_shift(seq):
-    if len(seq) < 6:
+    if len(seq) < 8:
         return False
-    last = seq[-6:]
-    return len(set(last)) > 1 and abs(last.count(1) - last.count(0)) <= 1
+    last = seq[-8:]
+    # unstable if nearly equal BIG/SMALL
+    return abs(last.count("BIG") - last.count("SMALL")) <= 1
 
 def learn_patterns(seq):
-    for k in range(3,6):
+    for k in range(3, 6):
         if len(seq) > k:
             key = tuple(seq[-(k+1):-1])
-            st.session_state.patterns[k][key][seq[-1]] += 1
+            nxt = seq[-1]
+            st.session_state.patterns[k][key][nxt] += 1
 
-def predict_pattern(seq):
-    for k in range(5,2,-1):
+def pattern_signal(seq):
+    for k in range(5, 2, -1):
         key = tuple(seq[-k:])
         if key in st.session_state.patterns[k]:
-            c = st.session_state.patterns[k][key]
-            t = sum(c.values())
-            if t >= 3:
-                return ("BIG", c[1]/t) if c[1] > c[0] else ("SMALL", c[0]/t)
+            counts = st.session_state.patterns[k][key]
+            total = sum(counts.values())
+            if total >= 3:
+                best = max(counts, key=counts.get)
+                return best, counts[best] / total
     return None, 0
 
-def transformer_pred(seq):
-    if len(seq) < SEQ_MAX:
-        return None, 0
-    x = np.array(seq[-SEQ_MAX:]).reshape(1,SEQ_MAX)
-    p = float(st.session_state.transformer.predict(x, verbose=0)[0][0])
-    return ("BIG" if p >= 0.5 else "SMALL"), abs(p-0.5)*2
-
-def naive_bayes_pred(seq):
-    if len(st.session_state.X_nb) < 10:
-        return None, 0
-    clf = MultinomialNB()
-    clf.fit(st.session_state.X_nb, st.session_state.y_nb)
-    p = clf.predict_proba([seq[-10:]])[0]
-    idx = np.argmax(p)
-    return ("BIG" if idx == 1 else "SMALL"), p[idx]
-
-# ================= UI =================
-st.title("🧠 Heavy AI Predictor (Auto-Tuned + A/B Tested)")
-st.metric("Total Data", len(st.session_state.seq))
-
+# ================= PREDICTION =================
 prediction, confidence = None, 0
 conf_threshold = auto_threshold()
-regime = regime_shift(st.session_state.seq)
+regime = regime_shift(st.session_state.inputs)
 
-if len(st.session_state.seq) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
+if len(st.session_state.inputs) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
 
-    # --- Model A (Pattern) ---
-    a_pred, a_strength = predict_pattern(st.session_state.seq)
+    signals = []
 
-    # --- Model B (Transformer + NB) ---
-    t_pred, t_strength = transformer_pred(st.session_state.seq)
-    nb_pred, nb_strength = naive_bayes_pred(st.session_state.seq)
+    # ---- Pattern AI ----
+    p_pred, p_strength = pattern_signal(st.session_state.inputs)
+    if p_pred:
+        signals.append((p_pred, p_strength))
 
-    model_votes = []
-    if a_pred:
-        model_votes.append(("A", a_pred, a_strength))
-    if t_pred:
-        model_votes.append(("B", t_pred, t_strength))
-    if nb_pred:
-        model_votes.append(("B", nb_pred, nb_strength))
+    # ---- Naive Bayes ----
+    if len(st.session_state.X_train) >= 10:
+        clf = MultinomialNB()
+        clf.fit(st.session_state.X_train, st.session_state.y_train)
+        encoded = encode(st.session_state.inputs[-10:])
+        probs = clf.predict_proba([encoded])[0]
+        idx = np.argmax(probs)
+        signals.append((decode(idx), probs[idx]))
 
-    if model_votes:
-        votes = Counter(v[1] for v in model_votes)
-        top, count = votes.most_common(1)[0]
-        avg_strength = np.mean([v[2] for v in model_votes])
-        confidence = int(60 + avg_strength * 40)
+    if signals:
+        preds = [s[0] for s in signals]
+        strengths = [s[1] for s in signals]
+
+        top = max(set(preds), key=preds.count)
+        confidence = int(60 + np.mean(strengths) * 40)
 
         if regime:
             confidence -= 10
 
-        if count >= 1 and confidence >= conf_threshold:
+        if confidence >= conf_threshold:
             prediction = top
             st.success(f"🎯 Prediction: {prediction}")
             st.write(f"Confidence: {confidence}% (threshold {conf_threshold}%)")
-            if regime:
-                st.warning("⚠️ Regime shift detected — confidence reduced")
         else:
             st.warning("⏳ WAIT (low confidence)")
+    else:
+        st.warning("⏳ WAIT (learning patterns)")
 else:
     st.warning("🔒 PROFIT PROTECTION ACTIVE")
 
-# ================= CONFIRM & LEARN (FIXED UI) =================
-st.subheader("Confirm & Learn")
-actual = st.radio("Actual Result (temporary)", ["BIG","SMALL"], horizontal=True)
+# ================= INPUT UI =================
+st.subheader("🎮 Add Actual Result")
+actual = st.selectbox("Select actual result (temporary)", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
-    val = 1 if actual == "BIG" else 0
-    st.session_state.seq.append(val)
+    # ---- Learn ONLY here ----
+    st.session_state.inputs.append(actual)
 
-    learn_patterns(st.session_state.seq)
+    if len(st.session_state.inputs) >= 10:
+        st.session_state.X_train.append(
+            encode(st.session_state.inputs[-10:])
+        )
+        st.session_state.y_train.append(ENC[actual])
 
-    if len(st.session_state.seq) >= 10:
-        st.session_state.X_nb.append(st.session_state.seq[-10:])
-        st.session_state.y_nb.append(val)
-
-    if len(st.session_state.seq) >= SEQ_MAX:
-        st.session_state.tx.append(st.session_state.seq[-SEQ_MAX:])
-        st.session_state.ty.append(val)
-        if len(st.session_state.tx) % 5 == 0:
-            X = np.array(st.session_state.tx)
-            y = np.array(st.session_state.ty)
-            st.session_state.transformer.fit(X,y,epochs=2,verbose=0)
+    learn_patterns(st.session_state.inputs)
 
     result = "WAIT"
     if prediction:
         result = "WIN" if prediction == actual else "LOSS"
-        st.session_state.loss_streak = 0 if result=="WIN" else st.session_state.loss_streak+1
-
-        for m, pred, _ in model_votes:
-            st.session_state.model_perf[m].append(1 if pred==actual else 0)
+        st.session_state.loss_streak = (
+            0 if result == "WIN" else st.session_state.loss_streak + 1
+        )
+        st.session_state.model_perf.append(1 if result == "WIN" else 0)
 
     st.session_state.log.append({
-        "Time": datetime.now().strftime("%H:%M:%S"),
         "Prediction": prediction,
-        "Actual": actual,
         "Confidence": confidence,
+        "Actual": actual,
         "Result": result
     })
 
     st.success(f"Saved → {result}")
+    st.rerun()
 
 # ================= HISTORY =================
-st.divider()
 if st.session_state.log:
+    st.subheader("📊 Prediction History")
     df = pd.DataFrame(st.session_state.log)
-    st.dataframe(df, use_container_width=True)
+    st.dataframe(df)
 
-    buf = StringIO()
-    df.to_csv(buf, index=False)
-    st.download_button("⬇️ Download CSV", buf.getvalue(), "heavy_ai_final.csv")
+    buf = BytesIO()
+    df.to_excel(buf, index=False)
+    st.download_button(
+        "⬇️ Download Excel",
+        buf.getvalue(),
+        "big_small_ai.xlsx"
+    )
+
+st.markdown("---")
+st.caption("Built with ❤️ using Streamlit, Naive Bayes, Pattern AI & Self-Regulation")
