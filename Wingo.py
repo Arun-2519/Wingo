@@ -8,10 +8,10 @@ from sklearn.naive_bayes import MultinomialNB
 # ================= CONFIG =================
 MIN_DATA = 10
 BASE_CONF = 65
-LOSS_LIMIT = 3
+LOSS_LIMIT = 2
 
 st.set_page_config(page_title="🔵🔴 BIG vs SMALL AI", layout="centered")
-st.title("🔵 BIG vs 🔴 SMALL Predictor (AI Powered)")
+st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (DATA-DRIVEN FIXED)")
 
 st.markdown("""
 <style>
@@ -36,11 +36,6 @@ if "log" not in st.session_state:
 if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
 
-if "patterns" not in st.session_state:
-    st.session_state.patterns = {
-        k: defaultdict(lambda: defaultdict(int)) for k in range(3, 6)
-    }
-
 if "model_perf" not in st.session_state:
     st.session_state.model_perf = deque(maxlen=10)
 
@@ -55,102 +50,100 @@ def auto_threshold():
     if len(st.session_state.model_perf) < 5:
         return BASE_CONF
     acc = sum(st.session_state.model_perf) / len(st.session_state.model_perf)
-    return int(np.clip(BASE_CONF + (0.6 - acc) * 20, 60, 75))
+    return int(np.clip(BASE_CONF + (0.55 - acc) * 25, 65, 80))
 
-def regime_shift(seq):
-    if len(seq) < 8:
-        return False
-    last = seq[-8:]
-    return abs(last.count("BIG") - last.count("SMALL")) <= 1
+def current_streak(seq):
+    if not seq:
+        return None, 0
+    last = seq[-1]
+    length = 1
+    for i in range(len(seq)-2, -1, -1):
+        if seq[i] == last:
+            length += 1
+        else:
+            break
+    return last, length
 
-def learn_patterns(seq):
-    for k in range(3, 6):
-        if len(seq) > k:
-            key = tuple(seq[-(k+1):-1])
-            nxt = seq[-1]
-            st.session_state.patterns[k][key][nxt] += 1
-
-def pattern_signal(seq):
-    for k in range(5, 2, -1):
-        key = tuple(seq[-k:])
-        if key in st.session_state.patterns[k]:
-            counts = st.session_state.patterns[k][key]
-            total = sum(counts.values())
-            if total >= 3:
-                best = max(counts, key=counts.get)
-                return best, counts[best] / total
+def alternation_signal(seq):
+    if len(seq) < 3:
+        return None, 0
+    a, b, c = seq[-3:]
+    if a == c and a != b:
+        # strong alternation
+        return b, 0.75
     return None, 0
 
-# ================= PREDICTION (PAST DATA ONLY) =================
+# ================= PREDICTION (PAST ONLY) =================
 prediction, confidence = None, 0
 conf_threshold = auto_threshold()
 
-history = st.session_state.inputs.copy()  # 🔒 freeze past only
-regime = regime_shift(history)
+history = st.session_state.inputs.copy()
 
 if len(history) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
 
     signals = []
 
-    # ---- Pattern AI ----
-    p_pred, p_strength = pattern_signal(history)
-    if p_pred:
-        signals.append((p_pred, p_strength))
+    # ---------- Alternation (PRIMARY) ----------
+    alt_pred, alt_conf = alternation_signal(history)
+    if alt_pred:
+        signals.append((alt_pred, alt_conf))
 
-    # ---- Naive Bayes (trained only on past windows) ----
+    # ---------- Streak BREAK logic ----------
+    last, streak_len = current_streak(history)
+    if streak_len >= 3:
+        opp = "SMALL" if last == "BIG" else "BIG"
+        signals.append((opp, 0.6))
+
+    # ---------- Naive Bayes (SUPPORT ONLY) ----------
     if len(st.session_state.X_train) >= 10:
         clf = MultinomialNB()
         clf.fit(st.session_state.X_train, st.session_state.y_train)
-
-        encoded = encode(history[-10:])
-        probs = clf.predict_proba([encoded])[0]
+        probs = clf.predict_proba([encode(history[-10:])])[0]
         idx = np.argmax(probs)
-        signals.append((DEC[idx], probs[idx]))
+        nb_pred = DEC[idx]
+        nb_conf = min(0.1, probs[idx] * 0.1)  # cap NB influence
+        signals.append((nb_pred, nb_conf))
 
     if signals:
         preds = [s[0] for s in signals]
         strengths = [s[1] for s in signals]
 
-        top = max(set(preds), key=preds.count)
-        confidence = int(60 + np.mean(strengths) * 40)
+        prediction = max(set(preds), key=preds.count)
+        confidence = int(60 + sum(strengths) * 40)
 
-        if regime:
-            confidence -= 10
+        # penalty for long streaks
+        if streak_len >= 4:
+            confidence -= 20
 
         if confidence >= conf_threshold:
-            prediction = top
             st.success(f"🎯 Prediction: {prediction}")
             st.write(f"Confidence: {confidence}% (threshold {conf_threshold}%)")
         else:
+            prediction = None
             st.warning("⏳ WAIT (low confidence)")
     else:
-        st.warning("⏳ WAIT (learning patterns)")
+        st.warning("⏳ WAIT (no valid pattern)")
 else:
     st.warning("🔒 PROFIT PROTECTION ACTIVE")
 
-# ================= INPUT UI (NO LEAK) =================
-st.subheader("🎮 Add Actual Result")
-actual = st.selectbox("Select actual result (temporary)", ["BIG", "SMALL"])
+# ================= INPUT UI =================
+st.subheader("🎮 Enter Actual Result")
+actual = st.selectbox("Select result (temporary)", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
-    # ✅ Now we add the actual result
     st.session_state.inputs.append(actual)
 
-    # Train NB only after confirm
+    # train NB on past window only
     if len(st.session_state.inputs) >= 11:
         st.session_state.X_train.append(
             encode(st.session_state.inputs[-11:-1])
         )
         st.session_state.y_train.append(ENC[actual])
 
-    learn_patterns(st.session_state.inputs)
-
     result = "WAIT"
     if prediction:
         result = "WIN" if prediction == actual else "LOSS"
-        st.session_state.loss_streak = (
-            0 if result == "WIN" else st.session_state.loss_streak + 1
-        )
+        st.session_state.loss_streak = 0 if result == "WIN" else st.session_state.loss_streak + 1
         st.session_state.model_perf.append(1 if result == "WIN" else 0)
 
     st.session_state.log.append({
@@ -171,7 +164,7 @@ if st.session_state.log:
 
     buf = BytesIO()
     df.to_excel(buf, index=False)
-    st.download_button("⬇️ Download Excel", buf.getvalue(), "big_small_ai_fixed.xlsx")
+    st.download_button("⬇️ Download Excel", buf.getvalue(), "big_small_ai_fixed_v2.xlsx")
 
 st.markdown("---")
-st.caption("Built with ❤️ using Streamlit, Naive Bayes, Pattern AI & Proper ML Discipline")
+st.caption("Data-driven model: Alternation + Streak-Break + NB Support")
