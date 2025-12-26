@@ -1,142 +1,132 @@
 import streamlit as st
 import pandas as pd
-import numpy as np
+import math, json, os
 from collections import defaultdict
 from io import BytesIO
-import json
-import os
+from datetime import date
 
 # ================= CONFIG =================
-MIN_DATA = 10
-MIN_PATTERN_COUNT = 5
-MIN_PATTERN_CONF = 0.65
+MIN_TOTAL_DATA = 10
+DAILY_WARMUP = 5
+MIN_EDGE = 0.25          # net edge threshold
+MIN_WINRATE = 0.60
+MIN_PATTERN_COUNT = 6
 POST_LOSS_WAIT = 1
-DATA_FILE = "pattern_memory.json"
 
-st.set_page_config(page_title="🔵🔴 BIG vs SMALL AI", layout="centered")
-st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (Persistent & Stable)")
+DATA_DIR = "ai_memory"
+HISTORY_FILE = f"{DATA_DIR}/history.json"
+PATTERN_FILE = f"{DATA_DIR}/pattern_stats.json"
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# ================= LOAD / SAVE MEMORY =================
-def load_memory():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r") as f:
-            return json.load(f)
-    return {}
+st.set_page_config("🔵🔴 BIG vs SMALL AI", layout="centered")
+st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (DE-BIASED & STABLE)")
 
-def save_memory(mem):
-    with open(DATA_FILE, "w") as f:
-        json.dump(mem, f)
+# ================= LOAD =================
+def load_json(p, d):
+    return json.load(open(p)) if os.path.exists(p) else d
 
-if "memory" not in st.session_state:
-    st.session_state.memory = load_memory()
+def save_json(p, d):
+    json.dump(d, open(p,"w"))
 
-if "inputs" not in st.session_state:
-    st.session_state.inputs = []
+if "history" not in st.session_state:
+    st.session_state.history = load_json(HISTORY_FILE, [])
 
-if "log" not in st.session_state:
-    st.session_state.log = []
+if "pattern_stats" not in st.session_state:
+    raw = load_json(PATTERN_FILE, {})
+    st.session_state.pattern_stats = defaultdict(lambda: defaultdict(lambda:[0,0]))
+    for k,v in raw.items():
+        st.session_state.pattern_stats[tuple(eval(k))] = v
 
+if "today_inputs" not in st.session_state:
+    st.session_state.today_inputs = 0
+if "today_date" not in st.session_state:
+    st.session_state.today_date = str(date.today())
 if "post_loss_wait" not in st.session_state:
     st.session_state.post_loss_wait = 0
 
+if st.session_state.today_date != str(date.today()):
+    st.session_state.today_date = str(date.today())
+    st.session_state.today_inputs = 0
+
 # ================= HELPERS =================
-def get_patterns(seq):
-    pats = []
-    for k in range(3, 9):  # short + long
-        if len(seq) >= k:
-            pats.append(tuple(seq[-k:]))
-    return pats
+def entropy(seq):
+    p = seq.count("BIG") / len(seq)
+    if p in (0,1): return 0
+    return -p*math.log2(p)-(1-p)*math.log2(1-p)
 
-def update_memory(pattern, actual):
-    mem = st.session_state.memory
-    key = str(pattern)
-    if key not in mem:
-        mem[key] = {"BIG": [0,0], "SMALL": [0,0]}
-    mem[key][actual][1] += 1
+def detect_chop(seq):
+    return len(seq) < 6 or entropy(seq[-6:]) > 0.9
 
-def update_win(pattern, prediction):
-    key = str(pattern)
-    st.session_state.memory[key][prediction][0] += 1
+def patterns(seq):
+    return [tuple(seq[-k:]) for k in range(4,9) if len(seq)>=k]
 
-def best_pattern(seq):
-    candidates = []
-    for pat in get_patterns(seq):
-        key = str(pat)
-        stats = st.session_state.memory.get(key)
-        if not stats:
-            continue
-        for res, (win, tot) in stats.items():
-            if tot >= MIN_PATTERN_COUNT:
-                rate = win / tot
-                if rate >= MIN_PATTERN_CONF:
-                    candidates.append((res, rate, len(pat)))
-    if candidates:
-        # Prefer longer patterns
-        return max(candidates, key=lambda x: (x[1], x[2]))
-    return None, 0, 0
+def net_edge(win, tot):
+    return (win - (tot - win)) / tot
 
 # ================= PREDICTION =================
 prediction, confidence = None, 0
-history = st.session_state.inputs.copy()
+hist = st.session_state.history
 
 if st.session_state.post_loss_wait > 0:
     st.warning("⏳ WAIT (post-loss stabilization)")
 
-elif len(history) >= MIN_DATA:
+elif len(hist) >= MIN_TOTAL_DATA and st.session_state.today_inputs >= DAILY_WARMUP:
 
-    pred, conf, plen = best_pattern(history)
-
-    if pred:
-        prediction = pred
-        confidence = int(conf * 100)
-        st.success(f"🎯 Prediction: {prediction}")
-        st.write(f"Confidence: {confidence}% | Pattern length: {plen}")
+    if detect_chop(hist):
+        st.warning("⏳ WAIT (choppy regime)")
     else:
-        st.warning("⏳ WAIT (no confirmed pattern)")
+        candidates = []
+
+        for pat in patterns(hist):
+            stats = st.session_state.pattern_stats.get(pat,{})
+            for res,(win,tot) in stats.items():
+                if tot >= MIN_PATTERN_COUNT:
+                    wr = win/tot
+                    edge = net_edge(win,tot)
+                    if wr>=MIN_WINRATE and edge>=MIN_EDGE:
+                        candidates.append((res,wr,edge,len(pat)))
+
+        if candidates:
+            # prefer high edge, then longer pattern
+            best = max(candidates, key=lambda x:(x[2],x[3]))
+            prediction = best[0]
+            confidence = int(best[1]*100)
+            st.success(f"🎯 Prediction: {prediction}")
+            st.write(f"Confidence: {confidence}% | Edge: {round(best[2],2)} | Len: {best[3]}")
+        else:
+            st.warning("⏳ WAIT (no high-edge pattern)")
 else:
-    st.warning("🕐 Collecting data...")
+    st.warning("🕐 Warming up…")
 
 # ================= INPUT =================
-actual = st.selectbox("Enter Actual Result", ["BIG", "SMALL"])
+actual = st.selectbox("Enter Actual Result", ["BIG","SMALL"])
 
 if st.button("Confirm & Learn"):
 
-    st.session_state.inputs.append(actual)
+    if st.session_state.post_loss_wait>0:
+        st.session_state.post_loss_wait-=1
 
-    # Update all pattern memories
-    for pat in get_patterns(st.session_state.inputs[:-1]):
-        update_memory(pat, actual)
+    st.session_state.history.append(actual)
+    st.session_state.today_inputs+=1
 
-        if prediction and prediction == actual:
-            update_win(pat, prediction)
+    for pat in patterns(st.session_state.history[:-1]):
+        if prediction:
+            st.session_state.pattern_stats[pat][prediction][1]+=1
+            if prediction==actual:
+                st.session_state.pattern_stats[pat][prediction][0]+=1
 
-    result = "WAIT"
-    if prediction:
-        if prediction == actual:
-            result = "WIN"
-            st.session_state.post_loss_wait = 0
-        else:
-            result = "LOSS"
-            st.session_state.post_loss_wait = POST_LOSS_WAIT
+    if prediction and prediction!=actual:
+        st.session_state.post_loss_wait=POST_LOSS_WAIT
 
-    save_memory(st.session_state.memory)
+    save_json(HISTORY_FILE, st.session_state.history)
+    save_json(PATTERN_FILE,{str(k):v for k,v in st.session_state.pattern_stats.items()})
 
-    st.session_state.log.append({
-        "Prediction": prediction,
-        "Actual": actual,
-        "Confidence": confidence,
-        "Result": result
-    })
-
-    st.success(f"Saved → {result}")
+    st.success("Saved & Learned")
     st.rerun()
 
-# ================= HISTORY =================
-if st.session_state.log:
-    df = pd.DataFrame(st.session_state.log)
-    st.dataframe(df)
-    buf = BytesIO()
-    df.to_excel(buf, index=False)
-    st.download_button("⬇️ Download Excel", buf.getvalue(), "big_small_ai_persistent.xlsx")
+# ================= VIEW =================
+if st.session_state.history:
+    df = pd.DataFrame({"Result":st.session_state.history})
+    st.dataframe(df.tail(50))
 
-st.caption("Persistent pattern AI • Short + Long memory • Multi-day learning")
+st.caption("Edge-based AI • Long pattern priority • No blind alternation")
