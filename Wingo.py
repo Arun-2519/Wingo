@@ -1,17 +1,18 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from collections import defaultdict, deque
+from collections import deque
 from io import BytesIO
 from sklearn.naive_bayes import MultinomialNB
 
 # ================= CONFIG =================
 MIN_DATA = 10
 BASE_CONF = 65
-LOSS_LIMIT = 2
+LOSS_LIMIT = 2          # losses before cooldown
+COOLDOWN_ROUNDS = 2     # wait rounds after loss cluster
 
 st.set_page_config(page_title="🔵🔴 BIG vs SMALL AI", layout="centered")
-st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (DATA-DRIVEN FIXED)")
+st.title("🔵 BIG vs 🔴 BIG–SMALL AI Predictor (STABLE & SAFE)")
 
 st.markdown("""
 <style>
@@ -36,6 +37,9 @@ if "log" not in st.session_state:
 if "loss_streak" not in st.session_state:
     st.session_state.loss_streak = 0
 
+if "cooldown" not in st.session_state:
+    st.session_state.cooldown = 0
+
 if "model_perf" not in st.session_state:
     st.session_state.model_perf = deque(maxlen=10)
 
@@ -57,7 +61,7 @@ def current_streak(seq):
         return None, 0
     last = seq[-1]
     length = 1
-    for i in range(len(seq)-2, -1, -1):
+    for i in range(len(seq) - 2, -1, -1):
         if seq[i] == last:
             length += 1
         else:
@@ -69,39 +73,39 @@ def alternation_signal(seq):
         return None, 0
     a, b, c = seq[-3:]
     if a == c and a != b:
-        # strong alternation
-        return b, 0.75
+        return b, 0.75   # strong alternation
     return None, 0
 
 # ================= PREDICTION (PAST ONLY) =================
 prediction, confidence = None, 0
 conf_threshold = auto_threshold()
-
 history = st.session_state.inputs.copy()
 
-if len(history) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
+if st.session_state.cooldown > 0:
+    st.warning(f"⏳ COOLDOWN ACTIVE ({st.session_state.cooldown} rounds left)")
+elif len(history) >= MIN_DATA:
 
     signals = []
 
-    # ---------- Alternation (PRIMARY) ----------
+    # ---- Alternation (PRIMARY) ----
     alt_pred, alt_conf = alternation_signal(history)
     if alt_pred:
         signals.append((alt_pred, alt_conf))
 
-    # ---------- Streak BREAK logic ----------
+    # ---- Streak BREAK logic ----
     last, streak_len = current_streak(history)
     if streak_len >= 3:
         opp = "SMALL" if last == "BIG" else "BIG"
         signals.append((opp, 0.6))
 
-    # ---------- Naive Bayes (SUPPORT ONLY) ----------
+    # ---- Naive Bayes (SUPPORT ONLY) ----
     if len(st.session_state.X_train) >= 10:
         clf = MultinomialNB()
         clf.fit(st.session_state.X_train, st.session_state.y_train)
         probs = clf.predict_proba([encode(history[-10:])])[0]
         idx = np.argmax(probs)
         nb_pred = DEC[idx]
-        nb_conf = min(0.1, probs[idx] * 0.1)  # cap NB influence
+        nb_conf = min(0.1, probs[idx] * 0.1)  # capped influence
         signals.append((nb_pred, nb_conf))
 
     if signals:
@@ -111,9 +115,11 @@ if len(history) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
         prediction = max(set(preds), key=preds.count)
         confidence = int(60 + sum(strengths) * 40)
 
-        # penalty for long streaks
+        # penalties
         if streak_len >= 4:
             confidence -= 20
+        if st.session_state.loss_streak >= 1:
+            confidence -= 10
 
         if confidence >= conf_threshold:
             st.success(f"🎯 Prediction: {prediction}")
@@ -124,13 +130,18 @@ if len(history) >= MIN_DATA and st.session_state.loss_streak < LOSS_LIMIT:
     else:
         st.warning("⏳ WAIT (no valid pattern)")
 else:
-    st.warning("🔒 PROFIT PROTECTION ACTIVE")
+    st.warning("🕐 Collecting initial data...")
 
 # ================= INPUT UI =================
 st.subheader("🎮 Enter Actual Result")
 actual = st.selectbox("Select result (temporary)", ["BIG", "SMALL"])
 
 if st.button("Confirm & Learn"):
+
+    # reduce cooldown every round
+    if st.session_state.cooldown > 0:
+        st.session_state.cooldown -= 1
+
     st.session_state.inputs.append(actual)
 
     # train NB on past window only
@@ -143,14 +154,23 @@ if st.button("Confirm & Learn"):
     result = "WAIT"
     if prediction:
         result = "WIN" if prediction == actual else "LOSS"
-        st.session_state.loss_streak = 0 if result == "WIN" else st.session_state.loss_streak + 1
-        st.session_state.model_perf.append(1 if result == "WIN" else 0)
+
+        if result == "WIN":
+            st.session_state.loss_streak = 0
+            st.session_state.model_perf.append(1)
+        else:
+            st.session_state.loss_streak += 1
+            st.session_state.model_perf.append(0)
+
+            if st.session_state.loss_streak >= LOSS_LIMIT:
+                st.session_state.cooldown = COOLDOWN_ROUNDS
 
     st.session_state.log.append({
         "Prediction": prediction,
         "Confidence": confidence,
         "Actual": actual,
-        "Result": result
+        "Result": result,
+        "Cooldown": st.session_state.cooldown
     })
 
     st.success(f"Saved → {result}")
@@ -164,7 +184,11 @@ if st.session_state.log:
 
     buf = BytesIO()
     df.to_excel(buf, index=False)
-    st.download_button("⬇️ Download Excel", buf.getvalue(), "big_small_ai_fixed_v2.xlsx")
+    st.download_button(
+        "⬇️ Download Excel",
+        buf.getvalue(),
+        "big_small_ai_final_safe.xlsx"
+    )
 
 st.markdown("---")
-st.caption("Data-driven model: Alternation + Streak-Break + NB Support")
+st.caption("Capital-protected AI: Alternation + Streak-Break + Cooldown Control")
